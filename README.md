@@ -1,2 +1,2 @@
 # footballer
-Vision AI to analyse 
+Video processing & compression
