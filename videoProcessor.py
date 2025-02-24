@@ -4,17 +4,20 @@ import tempfile
 import datetime
 from loguru import logger
 import json
+import math
 
 # Get filename descriptor from the user
 file_descriptor = input("Enter the filename descriptor in CamelCase: ")
 
 TARGET_SIZE = 2 * 1024 * 1024 * 1024  # 2 GB
-SAMPLE_DURATION = 120  # two minutes
 
 # Set directory paths
 script_dir = os.path.dirname(os.path.abspath(__file__))
 source_dir = os.path.join(script_dir, "sourceVids")
-uncompressed_video = os.path.join(script_dir, f"{datetime.datetime.now().strftime('%Y.%m.%d')}.{file_descriptor}.mov")
+source_files = [os.path.join(source_dir, f) for f in os.listdir(source_dir) if f.lower().endswith(".mov")]
+source_files.sort(key=os.path.getctime)  # sort by creation time instead of mod time
+first_file_date = datetime.datetime.fromtimestamp(os.path.getctime(source_files[0])).strftime('%Y.%m.%d')
+uncompressed_video = os.path.join(script_dir, f"{first_file_date}.{file_descriptor}.mov")
 
 # function to compress video using given CRF value
 def video_compressor(orig_file, crf):
@@ -38,7 +41,7 @@ def video_duration(video_path):
     return float(duration.stdout.strip())
 
 # function to join videos in a folder into one video
-def join_videos(sourceFolder, new_name):
+def join_and_mute(sourceFolder, new_name):
     # Find all MOV files in the source directory
     source_files = [os.path.join(sourceFolder, f) for f in os.listdir(sourceFolder) if f.lower().endswith(".mov")]
     logger.trace(f"Number of .mov files found: {len(source_files)}")
@@ -62,49 +65,53 @@ def join_videos(sourceFolder, new_name):
         os.remove(temp_concat_file.name)
 
 # make the silent concatenated video
-join_videos(source_dir, uncompressed_video)
+join_and_mute(source_dir, uncompressed_video)
 
-# create sample vid for testing CRF values
-sample_video = os.path.join(script_dir, f"sampleVid.mov")
-sample_command = [
-    'ffmpeg', '-y', '-i', uncompressed_video, '-t', str(SAMPLE_DURATION), sample_video
-]
-subprocess.run(sample_command, check=True)
-sample_ratio = video_duration(uncompressed_video) / SAMPLE_DURATION # gives the multiplier of the sample to give the full video size
+def two_pass_encode(input_file, output_file):
+    '''
+    Perform a two-pass encode to fit the final video near the target_size_gb (in GB).
+    '''
+    global TARGET_SIZE
 
-# use a binary search to find the lowest CRF value that will compress the video to the target size without going over
-lowCRF, highCRF = 0, 35
-estimated_sizes = {}
-
-while lowCRF <= highCRF:
-    mid_crf = (lowCRF + highCRF) // 2
-    sample_uncompressed_video = video_compressor(sample_video, mid_crf)
-    sample_size = os.path.getsize(sample_uncompressed_video)
-    estimated_size = sample_size * sample_ratio
-    logger.debug(f"Estimated size at CRF={mid_crf}: {estimated_size / (1024**3):.2f} GB")
-    if estimated_size <= TARGET_SIZE:
-        estimated_sizes[mid_crf] = estimated_size
-        highCRF = mid_crf - 1
-    else:
-        logger.warning(f"Estimation of CRF={mid_crf} is {estimated_size / (1024**3):.2f} GB, which is over the target size {TARGET_SIZE / (1024**3):.2f} GB")
-        lowCRF = mid_crf + 1
-    logger.debug(f"Logging full estimated_sizes on each loop for debugging purposes:\n{json.dumps(estimated_sizes, indent=2)}")
-    os.remove(sample_uncompressed_video) # clean up the sample file
-# pretty-print the estimated sizes
-logger.debug(f"ESTIMATED SIZES:\n{json.dumps(estimated_sizes, indent=2)}")
-
-# best CRF is the lowest that made it into the estimated_sizes
-if estimated_sizes:
-    best_crf = min(estimated_sizes, key=estimated_sizes.get)
-    logger.success(f"The recommended CRF value is {best_crf} with an estimated size of {estimated_sizes[best_crf] / (1024**3):.2f} GB")
-else:
-    logger.error("Failed to find an appropriate CRF value.")
-    raise ValueError("Compression failed.")
+    # get the total duration in seconds
+    probe_cmd = ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', input_file]
+    duration_str = subprocess.check_output(probe_cmd).decode().strip()
+    duration_sec = float(duration_str)
+    
+    # Compute the necessary bitrate (bits per second).
+    # Multiply bytes * 8 to convert to bits; divide by video duration.
+    target_bytes = int(TARGET_SIZE * .98)# target size in bytes
+    video_bitrate = (target_bytes * 8) / duration_sec
+    
+    # Optional: set maxrate to something slightly higher to accommodate variations.
+    maxrate = math.ceil(video_bitrate * 1.25)
+    
+    # Pass 1 (analysis only, writes to a temporary log file).
+    pass1_cmd = [
+        "ffmpeg", "-y", "-i", input_file, "-an", 
+        "-c:v", "libx264",
+        "-b:v", str(int(video_bitrate)),
+        "-maxrate", str(maxrate),
+        "-pass", "1",
+        "-f", "mp4", 
+        "/dev/null"
+    ]
+    subprocess.run(pass1_cmd, check=True)
+    
+    # Pass 2 (actual output).
+    pass2_cmd = [
+        "ffmpeg", "-y", "-i", input_file, "-an",
+        "-c:v", "libx264",
+        "-b:v", str(int(video_bitrate)),
+        "-maxrate", str(maxrate),
+        "-pass", "2",
+        output_file
+    ]
+    subprocess.run(pass2_cmd, check=True)
 
 # Run ffmpeg command to compress the concatenated video with the best CRF value
 compressed_filename = os.path.join(script_dir, f"{os.path.splitext(os.path.basename(uncompressed_video))[0]}.compressed.mp4")
-compress_command = [
-    'ffmpeg', '-y', '-i', uncompressed_video, '-c:v', 'libx264', '-crf', str(best_crf), compressed_filename
-]
-subprocess.run(compress_command, check=True)
+#compress_command = ['ffmpeg', '-y', '-i', uncompressed_video, '-c:v', 'libx264', '-crf', str(best_crf), compressed_filename]
+#subprocess.run(compress_command, check=True)
+two_pass_encode(uncompressed_video, compressed_filename)
 logger.success(f"Video compressed successfully into {compressed_filename}")
