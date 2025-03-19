@@ -1,0 +1,2 @@
+loguru==0.7.3
+pipdeptree==2.25.1
